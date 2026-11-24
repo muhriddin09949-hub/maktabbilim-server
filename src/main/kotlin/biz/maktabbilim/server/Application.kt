@@ -401,8 +401,11 @@ fun Application.module() {
                 text = req.text.trim()
             )
             val payload = json.encodeToString(dto)
-            rooms[req.channelId]?.forEach { session ->
-                runCatching { session.send(Frame.Text(payload)) }
+            val targetSessions = rooms[req.channelId]
+            if (targetSessions != null) {
+                for (session in targetSessions) {
+                    runCatching { session.send(Frame.Text(payload)) }
+                }
             }
             call.respond(HttpStatusCode.Created, dto)
         }
@@ -415,8 +418,10 @@ fun Application.module() {
                 for (frame in incoming) {
                     if (frame is Frame.Text) {
                         val raw = frame.readText()
-                        set.forEach { peer ->
-                            if (peer != this) runCatching { peer.send(Frame.Text(raw)) }
+                        for (peer in set) {
+                            if (peer != this) {
+                                runCatching { peer.send(Frame.Text(raw)) }
+                            }
                         }
                     }
                 }
