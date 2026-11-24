@@ -6,6 +6,7 @@ import io.ktor.client.*
 import io.ktor.client.call.*
 import io.ktor.client.engine.cio.*
 import io.ktor.client.request.*
+import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
@@ -18,7 +19,6 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
-import io.ktor.websocket.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
@@ -171,6 +171,8 @@ object DatabaseManager {
                     );
                     """.trimIndent()
                 )
+                // Eski xato keshlarni tozalash
+                st.execute("DELETE FROM ai_faq_cache WHERE answer LIKE 'Kechirasiz, javob olishda xatolik%'")
             }
         }
     }
@@ -185,6 +187,26 @@ fun main() {
     }.start(wait = true)
 }
 
+private fun extractTextFromGeminiJson(root: JsonObject): String? {
+    root["output_text"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { return it.trim() }
+
+    root["output"]?.jsonArray?.firstOrNull()?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull
+        ?.takeIf { it.isNotBlank() }?.let { return it.trim() }
+
+    root["steps"]?.jsonArray?.forEach { el ->
+        val txt = el.jsonObject["model_output"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull
+        if (!txt.isNullOrBlank()) return txt.trim()
+    }
+
+    root["candidates"]?.jsonArray?.firstOrNull()
+        ?.jsonObject?.get("content")?.jsonObject
+        ?.get("parts")?.jsonArray?.firstOrNull()
+        ?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull
+        ?.takeIf { it.isNotBlank() }?.let { return it.trim() }
+
+    return null
+}
+
 fun Application.module() {
     val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     val httpClient = HttpClient(CIO) {
@@ -195,9 +217,8 @@ fun Application.module() {
 
     val botToken = System.getenv("TELEGRAM_BOT_TOKEN") ?: ""
     val adminSecret = System.getenv("ADMIN_SECRET") ?: "maktabbilim_admin_2026"
-    val geminiApiKey = System.getenv("GEMINI_API_KEY") ?: ""
+    val geminiApiKey = (System.getenv("GEMINI_API_KEY") ?: "").trim()
 
-    // Jonli WebSocket xonalari (channelId -> aktiv ulanishlar)
     val rooms = ConcurrentHashMap<String, MutableSet<WebSocketSession>>()
 
     install(ContentNegotiation) { json(json) }
@@ -272,7 +293,6 @@ fun Application.module() {
             call.respond(items)
         }
 
-        // Admin orqali yangi darslik/video qo'shish
         post("/api/v1/content") {
             val secret = call.request.headers["X-Admin-Secret"] ?: ""
             if (secret != adminSecret) {
@@ -300,7 +320,7 @@ fun Application.module() {
             call.respond(HttpStatusCode.Created, mapOf("status" to "saved"))
         }
 
-        // 2. Telegram yopiq kanalidagi fayl uchun xavfsiz yuklash linkini olish (Token APK ichida bo'lmaydi!)
+        // 2. Telegram yopiq kanalidagi fayl uchun xavfsiz yuklash linkini olish
         get("/api/v1/telegram/file-url") {
             val fileId = call.request.queryParameters["file_id"]
             if (fileId.isNullOrBlank() || botToken.isBlank()) {
@@ -318,7 +338,7 @@ fun Application.module() {
             call.respond(TelegramFileUrlResponse(downloadUrl = url))
         }
 
-        // 3. Chat & Guruhlar: oxirgi 30 ta xabarni yuklash (paginatsiya)
+        // 3. Chat & Guruhlar: oxirgi 30 ta xabarni yuklash
         get("/api/v1/messages") {
             val channelId = call.request.queryParameters["channel_id"] ?: "global_chat"
             val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 30).coerceIn(1, 50)
@@ -353,7 +373,6 @@ fun Application.module() {
             call.respond(list.reversed())
         }
 
-        // Chatga xabar yuborish (DB + jonli WebSocket tarqatish)
         post("/api/v1/messages") {
             val req = call.receive<SendMessageRequest>()
             if (req.text.isBlank()) {
@@ -388,7 +407,6 @@ fun Application.module() {
             call.respond(HttpStatusCode.Created, dto)
         }
 
-        // Jonli WebSocket ulanish (/ws/chat/{channelId})
         webSocket("/ws/chat/{channelId}") {
             val channelId = call.parameters["channelId"] ?: "global_chat"
             val set = rooms.computeIfAbsent(channelId) { ConcurrentHashMap.newKeySet() }
@@ -407,7 +425,7 @@ fun Application.module() {
             }
         }
 
-        // 4. AI Repetitor (FAQ kesh + Server-side Gemini API)
+        // 4. AI Repetitor (FAQ kesh + Fallback zanjiri: generateContent va interactions)
         post("/api/v1/ai/ask") {
             val req = call.receive<AiAskRequest>()
             val norm = req.question.trim().lowercase()
@@ -422,8 +440,11 @@ fun Application.module() {
                     ps.setString(1, norm)
                     ps.executeQuery().use { rs ->
                         if (rs.next()) {
-                            call.respond(AiAskResponse(answer = rs.getString("answer"), fromCache = true))
-                            return@post
+                            val cached = rs.getString("answer")
+                            if (!cached.startsWith("Kechirasiz, javob olishda xatolik")) {
+                                call.respond(AiAskResponse(answer = cached, fromCache = true))
+                                return@post
+                            }
                         }
                     }
                 }
@@ -440,45 +461,93 @@ fun Application.module() {
             }
 
             val prompt = """
-                Sen O'zbekiston maktablarining ${req.grade}-sinf o'quvchilari uchun mehribon AI Repetitorsan.
+                Sen O'zbekiston maktablarining ${req.grade}-sinf o'quvchilari uchun mehribon AI Repetitorsan (MaktabBilim.biz Milliy Intellekti).
                 O'zbek tilida, sodda, bosqichma-bosqich va tushunarli tushuntir. Murakkab LaTeX belgilarsiz oddiy formulalar bilan yoz.
-                Savol: ${req.question}
+                Foydalanuvchi so'rovi: ${req.question}
             """.trimIndent()
 
-            val bodyJson = buildJsonObject {
-                putJsonArray("contents") {
-                    addJsonObject {
-                        putJsonArray("parts") {
-                            addJsonObject { put("text", prompt) }
+            var finalAnswer: String? = null
+            var lastError = ""
+
+            // 1-usul: interactions API (AQ.Ab8... kalitlari va yangi modellar uchun)
+            for (modelName in listOf("gemini-2.5-flash", "gemini-3.7-flash", "gemini-2.0-flash")) {
+                try {
+                    val interBody = buildJsonObject {
+                        put("model", modelName)
+                        put("input", prompt)
+                    }
+                    val httpResp = httpClient.post("https://generativelanguage.googleapis.com/v1beta/interactions?key=$geminiApiKey") {
+                        contentType(ContentType.Application.Json)
+                        setBody(interBody)
+                    }
+                    val rawText = httpResp.bodyAsText()
+                    if (httpResp.status.isSuccess()) {
+                        val parsed = extractTextFromGeminiJson(json.parseToJsonElement(rawText).jsonObject)
+                        if (!parsed.isNullOrBlank()) {
+                            finalAnswer = parsed
+                            break
                         }
+                    } else {
+                        lastError += "[interactions/$modelName ${httpResp.status.value}] "
+                    }
+                } catch (e: Exception) {
+                    lastError += "[interactions/$modelName: ${e.message}] "
+                }
+            }
+
+            // 2-usul: generateContent API (AIza... kalitlari uchun)
+            if (finalAnswer == null) {
+                for (modelName in listOf("gemini-2.5-flash", "gemini-2.0-flash")) {
+                    try {
+                        val bodyJson = buildJsonObject {
+                            putJsonArray("contents") {
+                                addJsonObject {
+                                    putJsonArray("parts") {
+                                        addJsonObject { put("text", prompt) }
+                                    }
+                                }
+                            }
+                        }
+                        val httpResp = httpClient.post("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$geminiApiKey") {
+                            contentType(ContentType.Application.Json)
+                            setBody(bodyJson)
+                        }
+                        val rawText = httpResp.bodyAsText()
+                        if (httpResp.status.isSuccess()) {
+                            val parsed = extractTextFromGeminiJson(json.parseToJsonElement(rawText).jsonObject)
+                            if (!parsed.isNullOrBlank()) {
+                                finalAnswer = parsed
+                                break
+                            }
+                        } else {
+                            lastError += "[generateContent/$modelName ${httpResp.status.value}: $rawText] "
+                        }
+                    } catch (e: Exception) {
+                        lastError += "[generateContent/$modelName: ${e.message}] "
                     }
                 }
             }
 
-            val resp: JsonObject = httpClient.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$geminiApiKey"
-            ) {
-                contentType(ContentType.Application.Json)
-                setBody(bodyJson)
-            }.body()
-
-            val answerText = resp["candidates"]?.jsonArray?.firstOrNull()
-                ?.jsonObject?.get("content")?.jsonObject
-                ?.get("parts")?.jsonArray?.firstOrNull()
-                ?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull
-                ?: "Kechirasiz, javob olishda xatolik yuz berdi."
-
-            DatabaseManager.dataSource?.connection?.use { conn ->
-                conn.prepareStatement(
-                    "INSERT INTO ai_faq_cache(question_norm, answer) VALUES (?, ?) ON CONFLICT (question_norm) DO NOTHING"
-                ).use { ps ->
-                    ps.setString(1, norm)
-                    ps.setString(2, answerText)
-                    ps.executeUpdate()
+            if (finalAnswer != null) {
+                DatabaseManager.dataSource?.connection?.use { conn ->
+                    conn.prepareStatement(
+                        "INSERT INTO ai_faq_cache(question_norm, answer) VALUES (?, ?) ON CONFLICT (question_norm) DO UPDATE SET answer = EXCLUDED.answer"
+                    ).use { ps ->
+                        ps.setString(1, norm)
+                        ps.setString(2, finalAnswer)
+                        ps.executeUpdate()
+                    }
                 }
+                call.respond(AiAskResponse(answer = finalAnswer, fromCache = false))
+            } else {
+                println("AI ERROR: $lastError")
+                call.respond(
+                    AiAskResponse(
+                        answer = "AI javobida xatolik: $lastError",
+                        fromCache = false
+                    )
+                )
             }
-
-            call.respond(AiAskResponse(answer = answerText, fromCache = false))
         }
     }
 }
