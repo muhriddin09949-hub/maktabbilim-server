@@ -528,17 +528,18 @@ fun Application.module() {
                 }
             }
 
-            if (finalAnswer != null) {
+            val resolvedAnswer = finalAnswer
+            if (resolvedAnswer != null) {
                 DatabaseManager.dataSource?.connection?.use { conn ->
                     conn.prepareStatement(
                         "INSERT INTO ai_faq_cache(question_norm, answer) VALUES (?, ?) ON CONFLICT (question_norm) DO UPDATE SET answer = EXCLUDED.answer"
                     ).use { ps ->
                         ps.setString(1, norm)
-                        ps.setString(2, finalAnswer)
+                        ps.setString(2, resolvedAnswer)
                         ps.executeUpdate()
                     }
                 }
-                call.respond(AiAskResponse(answer = finalAnswer, fromCache = false))
+                call.respond(AiAskResponse(answer = resolvedAnswer, fromCache = false))
             } else {
                 println("AI ERROR: $lastError")
                 call.respond(
