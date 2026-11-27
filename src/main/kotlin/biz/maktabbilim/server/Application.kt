@@ -110,7 +110,28 @@ data class UserProfileDto(
     val school: String,
     val grade: String,
     val avatar: String,
-    val online: Boolean
+    val online: Boolean,
+    val friendshipStatus: String = "none" // none | pending_sent | pending_received | accepted
+)
+
+@Serializable
+data class FriendRequestBody(
+    val fromUserId: String,
+    val toUserId: String
+)
+
+@Serializable
+data class FriendRespondBody(
+    val userId: String,
+    val friendId: String,
+    val accept: Boolean
+)
+
+@Serializable
+data class FriendsOverviewResponse(
+    val friends: List<UserProfileDto>,
+    val incomingRequests: List<UserProfileDto>,
+    val outgoingRequests: List<UserProfileDto>
 )
 
 @Serializable
@@ -199,6 +220,18 @@ object DatabaseManager {
                     """
                     CREATE INDEX IF NOT EXISTS idx_app_users_region
                     ON app_users(region, last_seen_ms DESC);
+                    """.trimIndent()
+                )
+                st.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS friendships (
+                        user_a VARCHAR(16) NOT NULL,
+                        user_b VARCHAR(16) NOT NULL,
+                        requester_id VARCHAR(16) NOT NULL,
+                        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        PRIMARY KEY (user_a, user_b)
+                    );
                     """.trimIndent()
                 )
                 st.execute(
@@ -319,6 +352,9 @@ fun Application.module() {
 
     fun generate9DigitId(): String = (100_000_000 + Random.nextInt(900_000_000)).toString()
 
+    fun orderedPair(u1: String, u2: String): Pair<String, String> =
+        if (u1 <= u2) u1 to u2 else u2 to u1
+
     install(ContentNegotiation) { json(json) }
     install(CallLogging)
     install(CORS) {
@@ -362,7 +398,6 @@ fun Application.module() {
             }
 
             DatabaseManager.dataSource?.connection?.use { conn ->
-                // Agar tasodifan ID band bo'lsa va boshqa odamga tegishli bo'lsa, yangi 9 xonali ID tanlash
                 if (req.userId.isBlank()) {
                     var attempts = 0
                     while (attempts < 10) {
@@ -413,7 +448,8 @@ fun Application.module() {
                     school = req.school.trim(),
                     grade = req.grade.trim(),
                     avatar = req.avatar.trim(),
-                    online = true
+                    online = true,
+                    friendshipStatus = "none"
                 )
             )
         }
@@ -444,10 +480,12 @@ fun Application.module() {
             call.respond(HttpStatusCode.OK, mapOf("status" to "ok"))
         }
 
+        // FAQAT 9 xonali ID orqali qidirish (ism orqali qidirish umuman yo'q!)
         get("/api/v1/users/search") {
-            val queryId = call.request.queryParameters["id"]?.trim() ?: ""
-            if (queryId.isBlank()) {
-                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "ID kiritilmadi"))
+            val queryId = call.request.queryParameters["id"]?.filter { it.isDigit() } ?: ""
+            val viewerId = call.request.queryParameters["viewer_id"]?.filter { it.isDigit() } ?: ""
+            if (queryId.length != 9) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "9 xonali ID kiriting"))
                 return@get
             }
             val ds = DatabaseManager.dataSource
@@ -468,6 +506,29 @@ fun Application.module() {
                             val dbSeen = rs.getLong("last_seen_ms")
                             val wsSeen = onlineUsers[uid] ?: 0L
                             val isOnline = (now - maxOf(dbSeen, wsSeen)) < 120_000L
+
+                            var fStatus = "none"
+                            if (viewerId.isNotBlank() && viewerId != uid) {
+                                val (ua, ub) = orderedPair(viewerId, uid)
+                                conn.prepareStatement(
+                                    "SELECT requester_id, status FROM friendships WHERE user_a = ? AND user_b = ? LIMIT 1"
+                                ).use { fps ->
+                                    fps.setString(1, ua)
+                                    fps.setString(2, ub)
+                                    fps.executeQuery().use { frs ->
+                                        if (frs.next()) {
+                                            val st = frs.getString("status")
+                                            val reqBy = frs.getString("requester_id")
+                                            fStatus = when (st) {
+                                                "accepted" -> "accepted"
+                                                "pending" -> if (reqBy == viewerId) "pending_sent" else "pending_received"
+                                                else -> "none"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             found = UserProfileDto(
                                 userId = uid,
                                 name = rs.getString("name"),
@@ -476,7 +537,8 @@ fun Application.module() {
                                 school = rs.getString("school"),
                                 grade = rs.getString("grade"),
                                 avatar = rs.getString("avatar"),
-                                online = isOnline
+                                online = isOnline,
+                                friendshipStatus = fStatus
                             )
                         }
                     }
@@ -487,6 +549,133 @@ fun Application.module() {
             } else {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "Foydalanuvchi topilmadi"))
             }
+        }
+
+        // Do'stlik taklifini yuborish
+        post("/api/v1/friends/request") {
+            val req = call.receive<FriendRequestBody>()
+            val fromId = req.fromUserId.filter { it.isDigit() }
+            val toId = req.toUserId.filter { it.isDigit() }
+            if (fromId.length != 9 || toId.length != 9 || fromId == toId) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Noto'g'ri ID"))
+                return@post
+            }
+            val (ua, ub) = orderedPair(fromId, toId)
+            DatabaseManager.dataSource?.connection?.use { conn ->
+                conn.prepareStatement(
+                    """
+                    INSERT INTO friendships(user_a, user_b, requester_id, status, updated_at)
+                    VALUES (?, ?, ?, 'pending', NOW())
+                    ON CONFLICT (user_a, user_b) DO UPDATE SET
+                        requester_id = CASE WHEN friendships.status = 'accepted' THEN friendships.requester_id ELSE EXCLUDED.requester_id END,
+                        status = CASE WHEN friendships.status = 'accepted' THEN 'accepted' ELSE 'pending' END,
+                        updated_at = NOW()
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, ua)
+                    ps.setString(2, ub)
+                    ps.setString(3, fromId)
+                    ps.executeUpdate()
+                }
+            }
+            call.respond(HttpStatusCode.OK, mapOf("status" to "pending_sent"))
+        }
+
+        // Do'stlik taklifini qabul qilish yoki rad etish
+        post("/api/v1/friends/respond") {
+            val req = call.receive<FriendRespondBody>()
+            val uid = req.userId.filter { it.isDigit() }
+            val fid = req.friendId.filter { it.isDigit() }
+            if (uid.length != 9 || fid.length != 9) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Noto'g'ri ID"))
+                return@post
+            }
+            val (ua, ub) = orderedPair(uid, fid)
+            DatabaseManager.dataSource?.connection?.use { conn ->
+                if (req.accept) {
+                    conn.prepareStatement(
+                        "UPDATE friendships SET status = 'accepted', updated_at = NOW() WHERE user_a = ? AND user_b = ?"
+                    ).use { ps ->
+                        ps.setString(1, ua)
+                        ps.setString(2, ub)
+                        ps.executeUpdate()
+                    }
+                } else {
+                    conn.prepareStatement(
+                        "DELETE FROM friendships WHERE user_a = ? AND user_b = ?"
+                    ).use { ps ->
+                        ps.setString(1, ua)
+                        ps.setString(2, ub)
+                        ps.executeUpdate()
+                    }
+                }
+            }
+            call.respond(HttpStatusCode.OK, mapOf("status" to if (req.accept) "accepted" else "rejected"))
+        }
+
+        // Qabul qilingan do'stlar va kiruvchi/chiquvchi takliflar ro'yxati
+        get("/api/v1/friends/list") {
+            val userId = call.request.queryParameters["user_id"]?.filter { it.isDigit() } ?: ""
+            if (userId.length != 9) {
+                call.respond(FriendsOverviewResponse(emptyList(), emptyList(), emptyList()))
+                return@get
+            }
+            val ds = DatabaseManager.dataSource
+            if (ds == null) {
+                call.respond(FriendsOverviewResponse(emptyList(), emptyList(), emptyList()))
+                return@get
+            }
+            val friends = mutableListOf<UserProfileDto>()
+            val incoming = mutableListOf<UserProfileDto>()
+            val outgoing = mutableListOf<UserProfileDto>()
+            val now = System.currentTimeMillis()
+
+            ds.connection.use { conn ->
+                conn.prepareStatement(
+                    """
+                    SELECT f.requester_id, f.status, u.user_id, u.name, u.region, u.district, u.school, u.grade, u.avatar, u.last_seen_ms
+                    FROM friendships f
+                    JOIN app_users u ON u.user_id = CASE WHEN f.user_a = ? THEN f.user_b ELSE f.user_a END
+                    WHERE f.user_a = ? OR f.user_b = ?
+                    ORDER BY f.updated_at DESC
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, userId)
+                    ps.setString(2, userId)
+                    ps.setString(3, userId)
+                    ps.executeQuery().use { rs ->
+                        while (rs.next()) {
+                            val peerId = rs.getString("user_id")
+                            val status = rs.getString("status")
+                            val requester = rs.getString("requester_id")
+                            val dbSeen = rs.getLong("last_seen_ms")
+                            val wsSeen = onlineUsers[peerId] ?: 0L
+                            val isOnline = (now - maxOf(dbSeen, wsSeen)) < 120_000L
+
+                            val dto = UserProfileDto(
+                                userId = peerId,
+                                name = rs.getString("name"),
+                                region = rs.getString("region"),
+                                district = rs.getString("district"),
+                                school = rs.getString("school"),
+                                grade = rs.getString("grade"),
+                                avatar = rs.getString("avatar"),
+                                online = isOnline,
+                                friendshipStatus = when (status) {
+                                    "accepted" -> "accepted"
+                                    "pending" -> if (requester == userId) "pending_sent" else "pending_received"
+                                    else -> "none"
+                                }
+                            )
+                            when (status) {
+                                "accepted" -> friends.add(dto)
+                                "pending" -> if (requester == userId) outgoing.add(dto) else incoming.add(dto)
+                            }
+                        }
+                    }
+                }
+            }
+            call.respond(FriendsOverviewResponse(friends, incoming, outgoing))
         }
 
         get("/api/v1/users/map-counts") {
