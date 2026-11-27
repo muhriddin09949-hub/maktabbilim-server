@@ -636,6 +636,22 @@ fun Application.module() {
             call.respond(HttpStatusCode.OK, mapOf("status" to "saved"))
         }
 
+        post("/api/v1/users/offline") {
+            val req = call.receive<UserHeartbeatRequest>()
+            val now = System.currentTimeMillis()
+            if (req.userId.isNotBlank()) {
+                onlineUsers.remove(req.userId)
+                lastSeenUsers[req.userId] = now
+                DatabaseManager.dataSource?.connection?.use { conn ->
+                    conn.prepareStatement("UPDATE app_users SET last_seen_ms = 0 WHERE user_id = ?").use { ps ->
+                        ps.setString(1, req.userId)
+                        ps.executeUpdate()
+                    }
+                }
+            }
+            call.respond(HttpStatusCode.OK, mapOf("status" to "offline"))
+        }
+
         post("/api/v1/users/heartbeat") {
             val req = call.receive<UserHeartbeatRequest>()
             val now = System.currentTimeMillis()
@@ -998,16 +1014,26 @@ fun Application.module() {
         get("/api/v1/presence") {
             val userId = call.request.queryParameters["user_id"] ?: ""
             val now = System.currentTimeMillis()
-            val lastPing = onlineUsers[userId]
-            val isOnline = lastPing != null && (now - lastPing) < 45_000L
-            if (!isOnline && lastPing != null) {
+            var lastPing = onlineUsers[userId] ?: 0L
+            if (lastPing == 0L && userId.isNotBlank()) {
+                DatabaseManager.dataSource?.connection?.use { conn ->
+                    conn.prepareStatement("SELECT last_seen_ms FROM app_users WHERE user_id = ? LIMIT 1").use { ps ->
+                        ps.setString(1, userId)
+                        ps.executeQuery().use { rs ->
+                            if (rs.next()) lastPing = rs.getLong(1)
+                        }
+                    }
+                }
+            }
+            val isOnline = lastPing > 0L && (now - lastPing) < 45_000L
+            if (!isOnline && onlineUsers.containsKey(userId)) {
                 onlineUsers.remove(userId)
             }
             call.respond(
                 PresenceResponse(
                     userId = userId,
                     online = isOnline,
-                    lastSeenMs = lastSeenUsers[userId] ?: 0L
+                    lastSeenMs = maxOf(lastSeenUsers[userId] ?: 0L, lastPing)
                 )
             )
         }
@@ -1202,18 +1228,6 @@ fun Application.module() {
                 }
             } finally {
                 set.remove(this)
-                if (userId.isNotBlank()) {
-                    val now = System.currentTimeMillis()
-                    onlineUsers.remove(userId)
-                    lastSeenUsers[userId] = now
-                    val presenceOff = buildJsonObject {
-                        put("type", "presence")
-                        put("userId", userId)
-                        put("online", false)
-                        put("lastSeenMs", now)
-                    }.toString()
-                    broadcastToRoom(channelId, presenceOff, exclude = this)
-                }
             }
         }
 
