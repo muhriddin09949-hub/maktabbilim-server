@@ -19,8 +19,8 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
+import io.ktor.websocket.*
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
 import java.net.URI
 import java.time.Duration
@@ -57,7 +57,8 @@ data class ChatMessageDto(
     val senderName: String,
     val senderId: String,
     val text: String,
-    val createdAt: String = ""
+    val createdAt: String = "",
+    val isRead: Boolean = false
 )
 
 @Serializable
@@ -66,6 +67,20 @@ data class SendMessageRequest(
     val senderName: String,
     val senderId: String,
     val text: String
+)
+
+@Serializable
+data class MarkReadRequest(
+    val channelId: String,
+    val userId: String,
+    val lastReadId: Long
+)
+
+@Serializable
+data class PresenceResponse(
+    val userId: String,
+    val online: Boolean,
+    val lastSeenMs: Long
 )
 
 @Serializable
@@ -163,6 +178,17 @@ object DatabaseManager {
                 )
                 st.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS channel_reads (
+                        channel_id VARCHAR(128) NOT NULL,
+                        user_id VARCHAR(120) NOT NULL,
+                        last_read_id BIGINT NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        PRIMARY KEY (channel_id, user_id)
+                    );
+                    """.trimIndent()
+                )
+                st.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS ai_faq_cache (
                         id BIGSERIAL PRIMARY KEY,
                         question_norm TEXT UNIQUE NOT NULL,
@@ -171,7 +197,6 @@ object DatabaseManager {
                     );
                     """.trimIndent()
                 )
-                // Eski xato keshlarni tozalash
                 st.execute("DELETE FROM ai_faq_cache WHERE answer LIKE 'Kechirasiz, javob olishda xatolik%'")
             }
         }
@@ -193,9 +218,12 @@ private fun extractTextFromGeminiJson(root: JsonObject): String? {
     root["output"]?.jsonArray?.firstOrNull()?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull
         ?.takeIf { it.isNotBlank() }?.let { return it.trim() }
 
-    root["steps"]?.jsonArray?.forEach { el ->
-        val txt = el.jsonObject["model_output"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull
-        if (!txt.isNullOrBlank()) return txt.trim()
+    val stepsArr = root["steps"]?.jsonArray
+    if (stepsArr != null) {
+        for (el in stepsArr) {
+            val txt = el.jsonObject["model_output"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull
+            if (!txt.isNullOrBlank()) return txt.trim()
+        }
     }
 
     root["candidates"]?.jsonArray?.firstOrNull()
@@ -220,6 +248,17 @@ fun Application.module() {
     val geminiApiKey = (System.getenv("GEMINI_API_KEY") ?: "").trim()
 
     val rooms = ConcurrentHashMap<String, MutableSet<WebSocketSession>>()
+    val onlineUsers = ConcurrentHashMap<String, Long>()
+    val lastSeenUsers = ConcurrentHashMap<String, Long>()
+
+    suspend fun broadcastToRoom(channelId: String, payload: String, exclude: WebSocketSession? = null) {
+        val targetSessions = rooms[channelId] ?: return
+        for (session in targetSessions) {
+            if (session != exclude) {
+                runCatching { session.send(Frame.Text(payload)) }
+            }
+        }
+    }
 
     install(ContentNegotiation) { json(json) }
     install(CallLogging)
@@ -338,10 +377,29 @@ fun Application.module() {
             call.respond(TelegramFileUrlResponse(downloadUrl = url))
         }
 
-        // 3. Chat & Guruhlar: oxirgi 30 ta xabarni yuklash
+        // 3. Online / Offline presence tekshiruvi
+        get("/api/v1/presence") {
+            val userId = call.request.queryParameters["user_id"] ?: ""
+            val now = System.currentTimeMillis()
+            val lastPing = onlineUsers[userId]
+            val isOnline = lastPing != null && (now - lastPing) < 45_000L
+            if (!isOnline && lastPing != null) {
+                onlineUsers.remove(userId)
+            }
+            call.respond(
+                PresenceResponse(
+                    userId = userId,
+                    online = isOnline,
+                    lastSeenMs = lastSeenUsers[userId] ?: 0L
+                )
+            )
+        }
+
+        // 4. Chat & Guruhlar: xabarlarni yuklash (o'qilganlik holati bilan)
         get("/api/v1/messages") {
             val channelId = call.request.queryParameters["channel_id"] ?: "global_chat"
-            val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 30).coerceIn(1, 50)
+            val viewerId = call.request.queryParameters["viewer_id"] ?: ""
+            val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 30).coerceIn(1, 100)
             val ds = DatabaseManager.dataSource
             if (ds == null) {
                 call.respond(emptyList<ChatMessageDto>())
@@ -349,6 +407,18 @@ fun Application.module() {
             }
             val list = mutableListOf<ChatMessageDto>()
             ds.connection.use { conn ->
+                var maxPeerReadId = 0L
+                if (viewerId.isNotBlank()) {
+                    conn.prepareStatement(
+                        "SELECT COALESCE(MAX(last_read_id), 0) FROM channel_reads WHERE channel_id = ? AND user_id <> ?"
+                    ).use { ps ->
+                        ps.setString(1, channelId)
+                        ps.setString(2, viewerId)
+                        ps.executeQuery().use { rs ->
+                            if (rs.next()) maxPeerReadId = rs.getLong(1)
+                        }
+                    }
+                }
                 conn.prepareStatement(
                     "SELECT id, channel_id, sender_name, sender_id, text, created_at FROM chat_messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?"
                 ).use { ps ->
@@ -356,14 +426,18 @@ fun Application.module() {
                     ps.setInt(2, limit)
                     ps.executeQuery().use { rs ->
                         while (rs.next()) {
+                            val msgId = rs.getLong("id")
+                            val senderId = rs.getString("sender_id")
+                            val isReadByPeer = viewerId.isNotBlank() && senderId == viewerId && msgId <= maxPeerReadId
                             list.add(
                                 ChatMessageDto(
-                                    id = rs.getLong("id"),
+                                    id = msgId,
                                     channelId = rs.getString("channel_id"),
                                     senderName = rs.getString("sender_name"),
-                                    senderId = rs.getString("sender_id"),
+                                    senderId = senderId,
                                     text = rs.getString("text"),
-                                    createdAt = rs.getString("created_at") ?: ""
+                                    createdAt = rs.getString("created_at") ?: "",
+                                    isRead = isReadByPeer
                                 )
                             )
                         }
@@ -373,6 +447,7 @@ fun Application.module() {
             call.respond(list.reversed())
         }
 
+        // Xabar yuborish (PostgreSQL + WebSocket real-time tarqatish)
         post("/api/v1/messages") {
             val req = call.receive<SendMessageRequest>()
             if (req.text.isBlank()) {
@@ -380,16 +455,20 @@ fun Application.module() {
                 return@post
             }
             var savedId = 0L
+            var createdAtStr = ""
             DatabaseManager.dataSource?.connection?.use { conn ->
                 conn.prepareStatement(
-                    "INSERT INTO chat_messages(channel_id, sender_name, sender_id, text) VALUES (?, ?, ?, ?) RETURNING id"
+                    "INSERT INTO chat_messages(channel_id, sender_name, sender_id, text) VALUES (?, ?, ?, ?) RETURNING id, created_at"
                 ).use { ps ->
                     ps.setString(1, req.channelId)
                     ps.setString(2, req.senderName)
                     ps.setString(3, req.senderId)
                     ps.setString(4, req.text.trim())
                     ps.executeQuery().use { rs ->
-                        if (rs.next()) savedId = rs.getLong(1)
+                        if (rs.next()) {
+                            savedId = rs.getLong(1)
+                            createdAtStr = rs.getString(2) ?: ""
+                        }
                     }
                 }
             }
@@ -398,39 +477,109 @@ fun Application.module() {
                 channelId = req.channelId,
                 senderName = req.senderName,
                 senderId = req.senderId,
-                text = req.text.trim()
+                text = req.text.trim(),
+                createdAt = createdAtStr,
+                isRead = false
             )
-            val payload = json.encodeToString(dto)
-            val targetSessions = rooms[req.channelId]
-            if (targetSessions != null) {
-                for (session in targetSessions) {
-                    runCatching { session.send(Frame.Text(payload)) }
-                }
-            }
+            val wsEnvelope = buildJsonObject {
+                put("type", "message")
+                put("id", dto.id)
+                put("channelId", dto.channelId)
+                put("senderName", dto.senderName)
+                put("senderId", dto.senderId)
+                put("text", dto.text)
+                put("createdAt", dto.createdAt)
+            }.toString()
+            broadcastToRoom(req.channelId, wsEnvelope)
             call.respond(HttpStatusCode.Created, dto)
         }
 
+        // Xabarlarni o'qilgan deb belgilash (✓✓ real-time)
+        post("/api/v1/messages/read") {
+            val req = call.receive<MarkReadRequest>()
+            DatabaseManager.dataSource?.connection?.use { conn ->
+                conn.prepareStatement(
+                    """
+                    INSERT INTO channel_reads(channel_id, user_id, last_read_id, updated_at)
+                    VALUES (?, ?, ?, NOW())
+                    ON CONFLICT (channel_id, user_id)
+                    DO UPDATE SET
+                        last_read_id = GREATEST(channel_reads.last_read_id, EXCLUDED.last_read_id),
+                        updated_at = NOW()
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, req.channelId)
+                    ps.setString(2, req.userId)
+                    ps.setLong(3, req.lastReadId)
+                    ps.executeUpdate()
+                }
+            }
+            val wsEnvelope = buildJsonObject {
+                put("type", "read_receipt")
+                put("channelId", req.channelId)
+                put("userId", req.userId)
+                put("lastReadId", req.lastReadId)
+            }.toString()
+            broadcastToRoom(req.channelId, wsEnvelope)
+            call.respond(HttpStatusCode.OK, mapOf("status" to "ok"))
+        }
+
+        // Real-time WebSocket xona (xabar + online/offline + typing + read_receipt)
         webSocket("/ws/chat/{channelId}") {
             val channelId = call.parameters["channelId"] ?: "global_chat"
+            val userId = call.request.queryParameters["userId"] ?: ""
             val set = rooms.computeIfAbsent(channelId) { ConcurrentHashMap.newKeySet() }
             set.add(this)
+
+            if (userId.isNotBlank()) {
+                val now = System.currentTimeMillis()
+                onlineUsers[userId] = now
+                lastSeenUsers[userId] = now
+                val presenceOn = buildJsonObject {
+                    put("type", "presence")
+                    put("userId", userId)
+                    put("online", true)
+                    put("lastSeenMs", now)
+                }.toString()
+                broadcastToRoom(channelId, presenceOn, exclude = this)
+            }
+
             try {
                 for (frame in incoming) {
                     if (frame is Frame.Text) {
                         val raw = frame.readText()
-                        for (peer in set) {
-                            if (peer != this) {
-                                runCatching { peer.send(Frame.Text(raw)) }
-                            }
+                        if (userId.isNotBlank()) {
+                            val now = System.currentTimeMillis()
+                            onlineUsers[userId] = now
+                            lastSeenUsers[userId] = now
+                        }
+                        val type = runCatching {
+                            json.parseToJsonElement(raw).jsonObject["type"]?.jsonPrimitive?.contentOrNull
+                        }.getOrNull()
+
+                        if (type != "ping") {
+                            broadcastToRoom(channelId, raw, exclude = this)
                         }
                     }
                 }
             } finally {
                 set.remove(this)
+                if (userId.isNotBlank()) {
+                    val now = System.currentTimeMillis()
+                    onlineUsers.remove(userId)
+                    lastSeenUsers[userId] = now
+                    val presenceOff = buildJsonObject {
+                        put("type", "presence")
+                        put("userId", userId)
+                        put("online", false)
+                        put("lastSeenMs", now)
+                    }.toString()
+                    broadcastToRoom(channelId, presenceOff, exclude = this)
+                }
             }
         }
 
-        // 4. AI Repetitor (FAQ kesh + Fallback zanjiri: generateContent va interactions)
+        // 5. AI Repetitor (FAQ kesh + Fallback zanjiri)
         post("/api/v1/ai/ask") {
             val req = call.receive<AiAskRequest>()
             val norm = req.question.trim().lowercase()
@@ -439,7 +588,6 @@ fun Application.module() {
                 return@post
             }
 
-            // Avval keshdan tekshirish
             DatabaseManager.dataSource?.connection?.use { conn ->
                 conn.prepareStatement("SELECT answer FROM ai_faq_cache WHERE question_norm = ? LIMIT 1").use { ps ->
                     ps.setString(1, norm)
@@ -474,8 +622,7 @@ fun Application.module() {
             var finalAnswer: String? = null
             var lastError = ""
 
-            // 1-usul: interactions API (AQ.Ab8... kalitlari va yangi modellar uchun)
-            for (modelName in listOf("gemini-2.5-flash", "gemini-3.7-flash", "gemini-2.0-flash")) {
+            for (modelName in listOf("gemini-3.8-flash", "gemini-3.7-flash")) {
                 try {
                     val interBody = buildJsonObject {
                         put("model", modelName)
@@ -483,7 +630,7 @@ fun Application.module() {
                     }
                     val httpResp = httpClient.post("https://generativelanguage.googleapis.com/v1beta/interactions?key=$geminiApiKey") {
                         contentType(ContentType.Application.Json)
-                        setBody(interBody)
+                        setBody(interBody.toString())
                     }
                     val rawText = httpResp.bodyAsText()
                     if (httpResp.status.isSuccess()) {
@@ -497,39 +644,6 @@ fun Application.module() {
                     }
                 } catch (e: Exception) {
                     lastError += "[interactions/$modelName: ${e.message}] "
-                }
-            }
-
-            // 2-usul: generateContent API (AIza... kalitlari uchun)
-            if (finalAnswer == null) {
-                for (modelName in listOf("gemini-2.5-flash", "gemini-2.0-flash")) {
-                    try {
-                        val bodyJson = buildJsonObject {
-                            putJsonArray("contents") {
-                                addJsonObject {
-                                    putJsonArray("parts") {
-                                        addJsonObject { put("text", prompt) }
-                                    }
-                                }
-                            }
-                        }
-                        val httpResp = httpClient.post("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$geminiApiKey") {
-                            contentType(ContentType.Application.Json)
-                            setBody(bodyJson)
-                        }
-                        val rawText = httpResp.bodyAsText()
-                        if (httpResp.status.isSuccess()) {
-                            val parsed = extractTextFromGeminiJson(json.parseToJsonElement(rawText).jsonObject)
-                            if (!parsed.isNullOrBlank()) {
-                                finalAnswer = parsed
-                                break
-                            }
-                        } else {
-                            lastError += "[generateContent/$modelName ${httpResp.status.value}: $rawText] "
-                        }
-                    } catch (e: Exception) {
-                        lastError += "[generateContent/$modelName: ${e.message}] "
-                    }
                 }
             }
 
