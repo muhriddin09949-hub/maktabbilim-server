@@ -6,6 +6,7 @@ import io.ktor.client.*
 import io.ktor.client.call.*
 import io.ktor.client.engine.cio.*
 import io.ktor.client.request.*
+import io.ktor.client.request.forms.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -20,10 +21,18 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
 import io.ktor.websocket.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import java.net.URI
+import java.security.KeyFactory
+import java.security.Signature
+import java.security.spec.PKCS8EncodedKeySpec
 import java.time.Duration
+import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 
@@ -102,6 +111,12 @@ data class UserHeartbeatRequest(
 )
 
 @Serializable
+data class FcmTokenRequest(
+    val userId: String,
+    val fcmToken: String
+)
+
+@Serializable
 data class UserProfileDto(
     val userId: String,
     val name: String,
@@ -111,7 +126,7 @@ data class UserProfileDto(
     val grade: String,
     val avatar: String,
     val online: Boolean,
-    val friendshipStatus: String = "none" // none | pending_sent | pending_received | accepted
+    val friendshipStatus: String = "none"
 )
 
 @Serializable
@@ -211,11 +226,13 @@ object DatabaseManager {
                         school VARCHAR(120) NOT NULL DEFAULT '',
                         grade VARCHAR(32) NOT NULL DEFAULT '',
                         avatar VARCHAR(64) NOT NULL DEFAULT 'boy_01',
+                        fcm_token TEXT NOT NULL DEFAULT '',
                         last_seen_ms BIGINT NOT NULL DEFAULT 0,
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     );
                     """.trimIndent()
                 )
+                runCatching { st.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS fcm_token TEXT NOT NULL DEFAULT ''") }
                 st.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_app_users_region
@@ -293,6 +310,127 @@ object DatabaseManager {
     }
 }
 
+/**
+ * Pure Kotlin/Java FCM HTTP v1 Push-bildirishnoma yuboruvchi (qo'shimcha kutubxonasiz).
+ */
+class FcmPushSender(
+    private val serviceAccountJsonRaw: String,
+    private val httpClient: HttpClient,
+    private val json: Json
+) {
+    private var projectId: String = ""
+    private var clientEmail: String = ""
+    private var privateKeyPem: String = ""
+
+    @Volatile
+    private var cachedToken: String? = null
+    @Volatile
+    private var tokenExpiresAtMs: Long = 0L
+
+    init {
+        if (serviceAccountJsonRaw.isNotBlank()) {
+            runCatching {
+                val obj = json.parseToJsonElement(serviceAccountJsonRaw).jsonObject
+                projectId = obj["project_id"]?.jsonPrimitive?.contentOrNull ?: ""
+                clientEmail = obj["client_email"]?.jsonPrimitive?.contentOrNull ?: ""
+                privateKeyPem = obj["private_key"]?.jsonPrimitive?.contentOrNull ?: ""
+            }
+        }
+    }
+
+    val isConfigured: Boolean
+        get() = projectId.isNotBlank() && clientEmail.isNotBlank() && privateKeyPem.isNotBlank()
+
+    private suspend fun getAccessToken(): String? {
+        val now = System.currentTimeMillis()
+        if (cachedToken != null && now < tokenExpiresAtMs - 60_000L) {
+            return cachedToken
+        }
+        if (!isConfigured) return null
+
+        return runCatching {
+            val nowSec = now / 1000L
+            val headerJson = """{"alg":"RS256","typ":"JWT"}"""
+            val claimJson = buildJsonObject {
+                put("iss", clientEmail)
+                put("scope", "https://www.googleapis.com/auth/firebase.messaging")
+                put("aud", "https://oauth2.googleapis.com/token")
+                put("iat", nowSec)
+                put("exp", nowSec + 3600L)
+            }.toString()
+
+            val encoder = Base64.getUrlEncoder().withoutPadding()
+            val unsignedJwt = "${encoder.encodeToString(headerJson.toByteArray())}.${encoder.encodeToString(claimJson.toByteArray())}"
+
+            val cleanPem = privateKeyPem
+                .replace("-----BEGIN PRIVATE KEY-----", "")
+                .replace("-----END PRIVATE KEY-----", "")
+                .replace("\\n", "")
+                .replace("\n", "")
+                .replace("\r", "")
+                .trim()
+            val keyBytes = Base64.getDecoder().decode(cleanPem)
+            val privateKey = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(keyBytes))
+            val sig = Signature.getInstance("SHA256withRSA").apply {
+                initSign(privateKey)
+                update(unsignedJwt.toByteArray(Charsets.UTF_8))
+            }
+            val signedJwt = "$unsignedJwt.${encoder.encodeToString(sig.sign())}"
+
+            val resp = httpClient.submitForm(
+                url = "https://oauth2.googleapis.com/token",
+                formParameters = parameters {
+                    append("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
+                    append("assertion", signedJwt)
+                }
+            )
+            val respObj = json.parseToJsonElement(resp.bodyAsText()).jsonObject
+            val accessToken = respObj["access_token"]?.jsonPrimitive?.contentOrNull
+            val expiresIn = respObj["expires_in"]?.jsonPrimitive?.longOrNull ?: 3600L
+            if (!accessToken.isNullOrBlank()) {
+                cachedToken = accessToken
+                tokenExpiresAtMs = now + expiresIn * 1000L
+            }
+            accessToken
+        }.getOrNull()
+    }
+
+    suspend fun sendPush(
+        fcmToken: String,
+        title: String,
+        body: String,
+        data: Map<String, String> = emptyMap()
+    ) {
+        if (!isConfigured || fcmToken.isBlank()) return
+        val accessToken = getAccessToken() ?: return
+        runCatching {
+            val payload = buildJsonObject {
+                putJsonObject("message") {
+                    put("token", fcmToken)
+                    putJsonObject("notification") {
+                        put("title", title)
+                        put("body", body)
+                    }
+                    putJsonObject("android") {
+                        put("priority", "high")
+                    }
+                    if (data.isNotEmpty()) {
+                        putJsonObject("data") {
+                            for ((k, v) in data) put(k, v)
+                        }
+                    }
+                }
+            }.toString()
+
+            httpClient.post("https://fcm.googleapis.com/v1/projects/$projectId/messages:send") {
+                header(HttpHeaders.Authorization, "Bearer $accessToken")
+                contentType(ContentType.Application.Json)
+                setBody(payload)
+            }
+        }
+    }
+}
+
 fun main() {
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
     DatabaseManager.init(System.getenv("DATABASE_URL"))
@@ -332,10 +470,12 @@ fun Application.module() {
             json(json)
         }
     }
+    val pushScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     val botToken = System.getenv("TELEGRAM_BOT_TOKEN") ?: ""
     val adminSecret = System.getenv("ADMIN_SECRET") ?: "maktabbilim_admin_2026"
     val geminiApiKey = (System.getenv("GEMINI_API_KEY") ?: "").trim()
+    val fcmSender = FcmPushSender(System.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") ?: "", httpClient, json)
 
     val rooms = ConcurrentHashMap<String, MutableSet<WebSocketSession>>()
     val onlineUsers = ConcurrentHashMap<String, Long>()
@@ -348,6 +488,34 @@ fun Application.module() {
                 runCatching { session.send(Frame.Text(payload)) }
             }
         }
+    }
+
+    fun getUserFcmToken(userId: String): String? {
+        val ds = DatabaseManager.dataSource ?: return null
+        return runCatching {
+            ds.connection.use { conn ->
+                conn.prepareStatement("SELECT fcm_token FROM app_users WHERE user_id = ? LIMIT 1").use { ps ->
+                    ps.setString(1, userId)
+                    ps.executeQuery().use { rs ->
+                        if (rs.next()) rs.getString("fcm_token")?.takeIf { it.isNotBlank() } else null
+                    }
+                }
+            }
+        }.getOrNull()
+    }
+
+    fun getUserNameById(userId: String): String {
+        val ds = DatabaseManager.dataSource ?: return "MaktabBilim"
+        return runCatching {
+            ds.connection.use { conn ->
+                conn.prepareStatement("SELECT name FROM app_users WHERE user_id = ? LIMIT 1").use { ps ->
+                    ps.setString(1, userId)
+                    ps.executeQuery().use { rs ->
+                        if (rs.next()) rs.getString("name") else "MaktabBilim"
+                    }
+                }
+            }
+        }.getOrDefault("MaktabBilim")
     }
 
     fun generate9DigitId(): String = (100_000_000 + Random.nextInt(900_000_000)).toString()
@@ -388,7 +556,7 @@ fun Application.module() {
             )
         }
 
-        // 0. Foydalanuvchi 9 xonali unikal ID + Ro'yxatdan o'tish + Hududiy xarita
+        // 0. Foydalanuvchi 9 xonali unikal ID + FCM Token + Hududiy xarita
         post("/api/v1/users/register") {
             val req = call.receive<UserRegisterRequest>()
             val now = System.currentTimeMillis()
@@ -454,6 +622,20 @@ fun Application.module() {
             )
         }
 
+        post("/api/v1/users/fcm-token") {
+            val req = call.receive<FcmTokenRequest>()
+            if (req.userId.isNotBlank() && req.fcmToken.isNotBlank()) {
+                DatabaseManager.dataSource?.connection?.use { conn ->
+                    conn.prepareStatement("UPDATE app_users SET fcm_token = ? WHERE user_id = ?").use { ps ->
+                        ps.setString(1, req.fcmToken.trim())
+                        ps.setString(2, req.userId.trim())
+                        ps.executeUpdate()
+                    }
+                }
+            }
+            call.respond(HttpStatusCode.OK, mapOf("status" to "saved"))
+        }
+
         post("/api/v1/users/heartbeat") {
             val req = call.receive<UserHeartbeatRequest>()
             val now = System.currentTimeMillis()
@@ -480,7 +662,6 @@ fun Application.module() {
             call.respond(HttpStatusCode.OK, mapOf("status" to "ok"))
         }
 
-        // FAQAT 9 xonali ID orqali qidirish (ism orqali qidirish umuman yo'q!)
         get("/api/v1/users/search") {
             val queryId = call.request.queryParameters["id"]?.filter { it.isDigit() } ?: ""
             val viewerId = call.request.queryParameters["viewer_id"]?.filter { it.isDigit() } ?: ""
@@ -551,7 +732,7 @@ fun Application.module() {
             }
         }
 
-        // Do'stlik taklifini yuborish
+        // Do'stlik taklifini yuborish + FCM Push
         post("/api/v1/friends/request") {
             val req = call.receive<FriendRequestBody>()
             val fromId = req.fromUserId.filter { it.isDigit() }
@@ -578,10 +759,22 @@ fun Application.module() {
                     ps.executeUpdate()
                 }
             }
+            pushScope.launch {
+                val token = getUserFcmToken(toId)
+                if (token != null) {
+                    val senderName = getUserNameById(fromId)
+                    fcmSender.sendPush(
+                        fcmToken = token,
+                        title = "Yangi do'stlik taklifi",
+                        body = "$senderName (ID: $fromId) sizga do'stlik taklifi yubordi",
+                        data = mapOf("type" to "friend_request", "peerId" to fromId, "peerName" to senderName)
+                    )
+                }
+            }
             call.respond(HttpStatusCode.OK, mapOf("status" to "pending_sent"))
         }
 
-        // Do'stlik taklifini qabul qilish yoki rad etish
+        // Do'stlik taklifini qabul qilish / rad etish + FCM Push
         post("/api/v1/friends/respond") {
             val req = call.receive<FriendRespondBody>()
             val uid = req.userId.filter { it.isDigit() }
@@ -610,10 +803,23 @@ fun Application.module() {
                     }
                 }
             }
+            if (req.accept) {
+                pushScope.launch {
+                    val token = getUserFcmToken(fid)
+                    if (token != null) {
+                        val acceptorName = getUserNameById(uid)
+                        fcmSender.sendPush(
+                            fcmToken = token,
+                            title = "Taklif qabul qilindi!",
+                            body = "$acceptorName do'stlik taklifingizni qabul qildi. Endi yozishishingiz mumkin.",
+                            data = mapOf("type" to "chat", "peerId" to uid, "peerName" to acceptorName)
+                        )
+                    }
+                }
+            }
             call.respond(HttpStatusCode.OK, mapOf("status" to if (req.accept) "accepted" else "rejected"))
         }
 
-        // Qabul qilingan do'stlar va kiruvchi/chiquvchi takliflar ro'yxati
         get("/api/v1/friends/list") {
             val userId = call.request.queryParameters["user_id"]?.filter { it.isDigit() } ?: ""
             if (userId.length != 9) {
@@ -772,7 +978,6 @@ fun Application.module() {
             call.respond(HttpStatusCode.Created, mapOf("status" to "saved"))
         }
 
-        // 2. Telegram yopiq kanalidagi fayl uchun xavfsiz yuklash linkini olish
         get("/api/v1/telegram/file-url") {
             val fileId = call.request.queryParameters["file_id"]
             if (fileId.isNullOrBlank() || botToken.isBlank()) {
@@ -790,7 +995,6 @@ fun Application.module() {
             call.respond(TelegramFileUrlResponse(downloadUrl = url))
         }
 
-        // 3. Online / Offline presence tekshiruvi
         get("/api/v1/presence") {
             val userId = call.request.queryParameters["user_id"] ?: ""
             val now = System.currentTimeMillis()
@@ -808,7 +1012,6 @@ fun Application.module() {
             )
         }
 
-        // 4. Chat & Guruhlar: xabarlarni yuklash (o'qilganlik holati bilan)
         get("/api/v1/messages") {
             val channelId = call.request.queryParameters["channel_id"] ?: "global_chat"
             val viewerId = call.request.queryParameters["viewer_id"] ?: ""
@@ -860,6 +1063,7 @@ fun Application.module() {
             call.respond(list.reversed())
         }
 
+        // Xabar yuborish + WebSocket + FCM Push
         post("/api/v1/messages") {
             val req = call.receive<SendMessageRequest>()
             if (req.text.isBlank()) {
@@ -903,6 +1107,30 @@ fun Application.module() {
                 put("createdAt", dto.createdAt)
             }.toString()
             broadcastToRoom(req.channelId, wsEnvelope)
+
+            // Agar 1-ga-1 DM kanali bo'lsa (dm_ID1_ID2), qabul qiluvchiga FCM Push yuborish
+            if (req.channelId.startsWith("dm_")) {
+                val parts = req.channelId.split("_")
+                val recipientId = parts.drop(1).firstOrNull { it != req.senderId && it.length == 9 }
+                if (recipientId != null) {
+                    pushScope.launch {
+                        val token = getUserFcmToken(recipientId)
+                        if (token != null) {
+                            fcmSender.sendPush(
+                                fcmToken = token,
+                                title = req.senderName,
+                                body = dto.text,
+                                data = mapOf(
+                                    "type" to "chat",
+                                    "peerId" to req.senderId,
+                                    "peerName" to req.senderName
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
             call.respond(HttpStatusCode.Created, dto)
         }
 
@@ -989,7 +1217,7 @@ fun Application.module() {
             }
         }
 
-        // 5. AI Repetitor (FAQ kesh + Fallback zanjiri)
+        // 5. AI Repetitor
         post("/api/v1/ai/ask") {
             val req = call.receive<AiAskRequest>()
             val norm = req.question.trim().lowercase()
