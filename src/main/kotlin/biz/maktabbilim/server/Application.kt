@@ -25,6 +25,7 @@ import kotlinx.serialization.json.*
 import java.net.URI
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.random.Random
 
 @Serializable
 data class HealthResponse(val status: String, val service: String, val databaseConnected: Boolean)
@@ -81,6 +82,41 @@ data class PresenceResponse(
     val userId: String,
     val online: Boolean,
     val lastSeenMs: Long
+)
+
+@Serializable
+data class UserRegisterRequest(
+    val userId: String = "",
+    val name: String,
+    val region: String,
+    val district: String = "",
+    val school: String = "",
+    val grade: String = "",
+    val avatar: String = "boy_01"
+)
+
+@Serializable
+data class UserHeartbeatRequest(
+    val userId: String,
+    val region: String = ""
+)
+
+@Serializable
+data class UserProfileDto(
+    val userId: String,
+    val name: String,
+    val region: String,
+    val district: String,
+    val school: String,
+    val grade: String,
+    val avatar: String,
+    val online: Boolean
+)
+
+@Serializable
+data class RegionOnlineCountDto(
+    val region: String,
+    val onlineCount: Int
 )
 
 @Serializable
@@ -144,6 +180,27 @@ object DatabaseManager {
         val ds = dataSource ?: return
         ds.connection.use { conn ->
             conn.createStatement().use { st ->
+                st.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS app_users (
+                        user_id VARCHAR(16) PRIMARY KEY,
+                        name VARCHAR(120) NOT NULL,
+                        region VARCHAR(80) NOT NULL,
+                        district VARCHAR(80) NOT NULL DEFAULT '',
+                        school VARCHAR(120) NOT NULL DEFAULT '',
+                        grade VARCHAR(32) NOT NULL DEFAULT '',
+                        avatar VARCHAR(64) NOT NULL DEFAULT 'boy_01',
+                        last_seen_ms BIGINT NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    """.trimIndent()
+                )
+                st.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_app_users_region
+                    ON app_users(region, last_seen_ms DESC);
+                    """.trimIndent()
+                )
                 st.execute(
                     """
                     CREATE TABLE IF NOT EXISTS edu_contents (
@@ -260,6 +317,8 @@ fun Application.module() {
         }
     }
 
+    fun generate9DigitId(): String = (100_000_000 + Random.nextInt(900_000_000)).toString()
+
     install(ContentNegotiation) { json(json) }
     install(CallLogging)
     install(CORS) {
@@ -291,6 +350,171 @@ fun Application.module() {
                     databaseConnected = DatabaseManager.dataSource != null
                 )
             )
+        }
+
+        // 0. Foydalanuvchi 9 xonali unikal ID + Ro'yxatdan o'tish + Hududiy xarita
+        post("/api/v1/users/register") {
+            val req = call.receive<UserRegisterRequest>()
+            val now = System.currentTimeMillis()
+            var finalId = req.userId.filter { it.isDigit() }
+            if (finalId.length != 9) {
+                finalId = generate9DigitId()
+            }
+
+            DatabaseManager.dataSource?.connection?.use { conn ->
+                // Agar tasodifan ID band bo'lsa va boshqa odamga tegishli bo'lsa, yangi 9 xonali ID tanlash
+                if (req.userId.isBlank()) {
+                    var attempts = 0
+                    while (attempts < 10) {
+                        var exists = false
+                        conn.prepareStatement("SELECT 1 FROM app_users WHERE user_id = ?").use { ps ->
+                            ps.setString(1, finalId)
+                            ps.executeQuery().use { rs -> exists = rs.next() }
+                        }
+                        if (!exists) break
+                        finalId = generate9DigitId()
+                        attempts++
+                    }
+                }
+
+                conn.prepareStatement(
+                    """
+                    INSERT INTO app_users(user_id, name, region, district, school, grade, avatar, last_seen_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        region = EXCLUDED.region,
+                        district = EXCLUDED.district,
+                        school = EXCLUDED.school,
+                        grade = EXCLUDED.grade,
+                        avatar = EXCLUDED.avatar,
+                        last_seen_ms = EXCLUDED.last_seen_ms
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, finalId)
+                    ps.setString(2, req.name.trim())
+                    ps.setString(3, req.region.trim())
+                    ps.setString(4, req.district.trim())
+                    ps.setString(5, req.school.trim())
+                    ps.setString(6, req.grade.trim())
+                    ps.setString(7, req.avatar.trim())
+                    ps.setLong(8, now)
+                    ps.executeUpdate()
+                }
+            }
+            onlineUsers[finalId] = now
+            lastSeenUsers[finalId] = now
+            call.respond(
+                UserProfileDto(
+                    userId = finalId,
+                    name = req.name.trim(),
+                    region = req.region.trim(),
+                    district = req.district.trim(),
+                    school = req.school.trim(),
+                    grade = req.grade.trim(),
+                    avatar = req.avatar.trim(),
+                    online = true
+                )
+            )
+        }
+
+        post("/api/v1/users/heartbeat") {
+            val req = call.receive<UserHeartbeatRequest>()
+            val now = System.currentTimeMillis()
+            if (req.userId.isNotBlank()) {
+                onlineUsers[req.userId] = now
+                lastSeenUsers[req.userId] = now
+                DatabaseManager.dataSource?.connection?.use { conn ->
+                    if (req.region.isNotBlank()) {
+                        conn.prepareStatement("UPDATE app_users SET last_seen_ms = ?, region = ? WHERE user_id = ?").use { ps ->
+                            ps.setLong(1, now)
+                            ps.setString(2, req.region.trim())
+                            ps.setString(3, req.userId)
+                            ps.executeUpdate()
+                        }
+                    } else {
+                        conn.prepareStatement("UPDATE app_users SET last_seen_ms = ? WHERE user_id = ?").use { ps ->
+                            ps.setLong(1, now)
+                            ps.setString(2, req.userId)
+                            ps.executeUpdate()
+                        }
+                    }
+                }
+            }
+            call.respond(HttpStatusCode.OK, mapOf("status" to "ok"))
+        }
+
+        get("/api/v1/users/search") {
+            val queryId = call.request.queryParameters["id"]?.trim() ?: ""
+            if (queryId.isBlank()) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "ID kiritilmadi"))
+                return@get
+            }
+            val ds = DatabaseManager.dataSource
+            if (ds == null) {
+                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Baza ulanmagan"))
+                return@get
+            }
+            var found: UserProfileDto? = null
+            val now = System.currentTimeMillis()
+            ds.connection.use { conn ->
+                conn.prepareStatement(
+                    "SELECT user_id, name, region, district, school, grade, avatar, last_seen_ms FROM app_users WHERE user_id = ? LIMIT 1"
+                ).use { ps ->
+                    ps.setString(1, queryId)
+                    ps.executeQuery().use { rs ->
+                        if (rs.next()) {
+                            val uid = rs.getString("user_id")
+                            val dbSeen = rs.getLong("last_seen_ms")
+                            val wsSeen = onlineUsers[uid] ?: 0L
+                            val isOnline = (now - maxOf(dbSeen, wsSeen)) < 120_000L
+                            found = UserProfileDto(
+                                userId = uid,
+                                name = rs.getString("name"),
+                                region = rs.getString("region"),
+                                district = rs.getString("district"),
+                                school = rs.getString("school"),
+                                grade = rs.getString("grade"),
+                                avatar = rs.getString("avatar"),
+                                online = isOnline
+                            )
+                        }
+                    }
+                }
+            }
+            if (found != null) {
+                call.respond(found!!)
+            } else {
+                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Foydalanuvchi topilmadi"))
+            }
+        }
+
+        get("/api/v1/users/map-counts") {
+            val ds = DatabaseManager.dataSource
+            if (ds == null) {
+                call.respond(emptyList<RegionOnlineCountDto>())
+                return@get
+            }
+            val threshold = System.currentTimeMillis() - 120_000L
+            val list = mutableListOf<RegionOnlineCountDto>()
+            ds.connection.use { conn ->
+                conn.prepareStatement(
+                    "SELECT region, COUNT(*) AS cnt FROM app_users WHERE last_seen_ms >= ? GROUP BY region"
+                ).use { ps ->
+                    ps.setLong(1, threshold)
+                    ps.executeQuery().use { rs ->
+                        while (rs.next()) {
+                            list.add(
+                                RegionOnlineCountDto(
+                                    region = rs.getString("region"),
+                                    onlineCount = rs.getInt("cnt")
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+            call.respond(list)
         }
 
         // 1. Ta'lim kontentlari (Darsliklar, Video Darslar, Kutubxona)
@@ -447,7 +671,6 @@ fun Application.module() {
             call.respond(list.reversed())
         }
 
-        // Xabar yuborish (PostgreSQL + WebSocket real-time tarqatish)
         post("/api/v1/messages") {
             val req = call.receive<SendMessageRequest>()
             if (req.text.isBlank()) {
@@ -494,7 +717,6 @@ fun Application.module() {
             call.respond(HttpStatusCode.Created, dto)
         }
 
-        // Xabarlarni o'qilgan deb belgilash (✓✓ real-time)
         post("/api/v1/messages/read") {
             val req = call.receive<MarkReadRequest>()
             DatabaseManager.dataSource?.connection?.use { conn ->
@@ -524,7 +746,6 @@ fun Application.module() {
             call.respond(HttpStatusCode.OK, mapOf("status" to "ok"))
         }
 
-        // Real-time WebSocket xona (xabar + online/offline + typing + read_receipt)
         webSocket("/ws/chat/{channelId}") {
             val channelId = call.parameters["channelId"] ?: "global_chat"
             val userId = call.request.queryParameters["userId"] ?: ""
